@@ -56,6 +56,7 @@ export interface ExecTask extends BaseTask {
   max_tries?: number;
   idem_key?: string;
   fence?: number; // monotonic counter for lease tokens
+  retry_delays?: number[];
 }
 
 export type Task = SleepTask | ExecTask;
@@ -87,6 +88,8 @@ export type Command =
       code: string;
       run_after?: string;
       idem_key?: string;
+      max_tries?: number;
+      retry_delays?: number[];
     }
   | { type: "set"; key: string; value: any }
   | { type: "complete_workflow" }
@@ -337,7 +340,10 @@ export class WorkflowEngine {
           });
           s.status = "failed";
         } else {
-          const backoff = Math.min(300, 2 ** t.tries);
+          const del = (t.retry_delays && t.retry_delays[t.tries - 1]) as
+            | number
+            | undefined;
+          const backoff = del ?? Math.min(300, 2 ** t.tries);
           t.status = "pending";
           t.lease = null;
           t.run_after = iso(addSeconds(tNow, backoff));
@@ -421,7 +427,16 @@ export class WorkflowEngine {
           this.scheduleSleep(s, tNow, c.seconds, c.until, c.label);
           break;
         case "exec":
-          this.scheduleExec(s, tNow, c.name, c.code, c.run_after, c.idem_key);
+          this.scheduleExec(
+            s,
+            tNow,
+            c.name,
+            c.code,
+            c.run_after,
+            c.idem_key,
+            c.max_tries,
+            c.retry_delays
+          );
           break;
         case "set":
           this.setPath(s.ctx, c.key, c.value);
@@ -484,7 +499,9 @@ export class WorkflowEngine {
     name: string | undefined,
     code: string,
     run_after?: string,
-    idem_key?: string
+    idem_key?: string,
+    max_tries?: number,
+    retry_delays?: number[]
   ) {
     const id = this.nextTaskId(s);
     const task: ExecTask = {
@@ -496,10 +513,12 @@ export class WorkflowEngine {
       run_after: run_after ?? iso(tNow),
       lease: null,
       tries: 0,
-      max_tries: 3,
+      max_tries: max_tries ?? 3,
       idem_key,
       fence: 0,
     };
+    if (retry_delays && Array.isArray(retry_delays))
+      (task as any).retry_delays = retry_delays.slice();
     s.tasks[id] = task;
     s.history.push({
       ts: iso(tNow),

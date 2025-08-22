@@ -366,6 +366,126 @@ describe("e2e workflows", () => {
     expect(seq).toEqual([2, 4]);
   });
 
+  it("exec per-call opts: retryDelays and maxTries respected", async () => {
+    const store = new InMemoryBlobStore();
+    const reg = new DeciderRegistry();
+    reg.register(
+      "demo:opts_per_call",
+      defineWorkflow("opts_per_call", function* (io) {
+        yield io.exec("always_fail", undefined, {
+          maxTries: 2,
+          retryDelays: [1, 9],
+        });
+        return yield io.complete();
+      })
+    );
+    const engine = new WorkflowEngine(store, reg);
+    const wfId = "wf_opts_per_call";
+    await engine.create(wfId, "demo:opts_per_call", {} as any);
+    const res = await runToCompletion(engine, store, wfId);
+    expect(res.status).toBe("failed");
+    const got = await store.get(wfId);
+    const retries = (got?.state.history ?? []).filter(
+      (e: any) => e.type === "ACTIVITY_RETRY"
+    );
+    const seq = retries.map((e: any) => e.after_seconds);
+    expect(seq).toEqual([1]);
+  });
+
+  it("execDefaults in params apply to io.exec by default", async () => {
+    const store = new InMemoryBlobStore();
+    const reg = new DeciderRegistry();
+    reg.register(
+      "demo:opts_defaults",
+      defineWorkflow("opts_defaults", function* (io) {
+        yield io.exec("always_fail");
+        return yield io.complete();
+      })
+    );
+    const engine = new WorkflowEngine(store, reg);
+    const wfId = "wf_opts_defaults";
+    await engine.create(wfId, "demo:opts_defaults", {
+      params: { execDefaults: { retryDelays: [3, 5], maxTries: 3 } },
+    } as any);
+    const res = await runToCompletion(engine, store, wfId);
+    expect(res.status).toBe("failed");
+    const got = await store.get(wfId);
+    const retries = (got?.state.history ?? []).filter(
+      (e: any) => e.type === "ACTIVITY_RETRY"
+    );
+    const seq = retries.map((e: any) => e.after_seconds);
+    expect(seq).toEqual([3, 5]);
+  });
+
+  it("per-call opts override execDefaults", async () => {
+    const store = new InMemoryBlobStore();
+    const reg = new DeciderRegistry();
+    reg.register(
+      "demo:opts_override",
+      defineWorkflow("opts_override", function* (io) {
+        yield io.exec("always_fail", undefined, {
+          retryDelays: [2, 2],
+          maxTries: 3,
+        });
+        return yield io.complete();
+      })
+    );
+    const engine = new WorkflowEngine(store, reg);
+    const wfId = "wf_opts_override";
+    await engine.create(wfId, "demo:opts_override", {
+      params: { execDefaults: { retryDelays: [7, 7], maxTries: 3 } },
+    } as any);
+    const res = await runToCompletion(engine, store, wfId);
+    expect(res.status).toBe("failed");
+    const got = await store.get(wfId);
+    const retries = (got?.state.history ?? []).filter(
+      (e: any) => e.type === "ACTIVITY_RETRY"
+    );
+    const seq = retries.map((e: any) => e.after_seconds);
+    expect(seq).toEqual([2, 2]);
+  });
+
+  it("runAfter schedules exec in the future", async () => {
+    const store = new InMemoryBlobStore();
+    const reg = new DeciderRegistry();
+    reg.register(
+      "demo:opts_run_after",
+      defineWorkflow("opts_run_after", function* (io) {
+        return yield io.complete();
+      })
+    );
+    // We'll schedule via a custom workflow that triggers an exec immediately after creation
+    reg.register(
+      "demo:opts_run_after_exec",
+      defineWorkflow("opts_run_after_exec", function* (io) {
+        yield io.exec("fast", undefined, {
+          runAfter: new Date(Date.now() + 10000).toISOString(),
+        });
+        return yield io.complete();
+      })
+    );
+    const engine = new WorkflowEngine(store, reg);
+    const wfId = "wf_opts_run_after";
+    const t0 = new Date();
+    const runAfterIso = new Date(t0.getTime() + 10000).toISOString();
+    await engine.create(wfId, "demo:opts_run_after_exec", {} as any);
+    // First tick at t0 schedules the exec for the future
+    const r0 = await engine.tick(wfId, t0);
+    expect(r0.next_wake).not.toBeNull();
+    // Because runAfter was computed inside the workflow at real Date.now(),
+    // next_wake should be >= t0 + ~10s. We assert it's in the future relative to t0.
+    const nw = new Date(r0.next_wake!);
+    expect(nw.getTime()).toBeGreaterThan(t0.getTime());
+    const leasedEarly = await engine.reserveReadyActivities(
+      wfId,
+      "w",
+      1,
+      60,
+      t0
+    );
+    expect(leasedEarly.length).toBe(0);
+  });
+
   it("race with signal wins", async () => {
     const store = new InMemoryBlobStore();
     const reg = new DeciderRegistry();

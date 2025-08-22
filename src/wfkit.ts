@@ -1,7 +1,7 @@
 import type { Command, Decider, WFEvent } from "./engine";
 
 export type Effect<T = any> =
-  | { kind: "exec"; name: string; input?: any }
+  | { kind: "exec"; name: string; input?: any; opts?: ExecOpts }
   | { kind: "sleep"; seconds?: number; until?: string }
   | { kind: "signal"; name: string }
   | { kind: "all"; children: Effect<any>[] }
@@ -10,8 +10,15 @@ export type Effect<T = any> =
   | { kind: "complete"; value?: any }
   | { kind: "fail"; reason?: string };
 
+export type ExecOpts = {
+  maxTries?: number;
+  retryDelays?: number[];
+  idemKey?: string;
+  runAfter?: string;
+};
+
 export type IO = {
-  exec: <T = any>(name: string, input?: any) => Effect<T>;
+  exec: <T = any>(name: string, input?: any, opts?: ExecOpts) => Effect<T>;
   sleep: (seconds: number) => Effect<void>;
   until: (iso: string) => Effect<void>;
   signal: <T = any>(name: string) => Effect<T>;
@@ -37,7 +44,7 @@ const TIMER_PREFIX = "S:";
 
 function IOImpl(): IO {
   return {
-    exec: (name, input) => ({ kind: "exec", name, input }),
+    exec: (name, input, opts) => ({ kind: "exec", name, input, opts }),
     sleep: (seconds) => ({ kind: "sleep", seconds }),
     until: (iso) => ({ kind: "sleep", until: iso }),
     signal: (name) => ({ kind: "signal", name }),
@@ -191,7 +198,17 @@ function interpret(
           action: eff.name,
           input: eff.input ?? null,
         });
-        commands.push({ type: "exec", name: `${ACT_PREFIX}${eid}`, code });
+        const defaults = (ctx as any)?.params?.execDefaults ?? {};
+        const o = { ...defaults, ...(eff.opts ?? {}) } as ExecOpts;
+        commands.push({
+          type: "exec",
+          name: `${ACT_PREFIX}${eid}`,
+          code,
+          run_after: o.runAfter,
+          idem_key: o.idemKey,
+          max_tries: o.maxTries,
+          retry_delays: o.retryDelays,
+        });
       }
       break; // wait
     } else if (eff.kind === "sleep") {
@@ -240,13 +257,22 @@ function interpret(
         const cs = slotOf(cid, child);
         if (cs.status === "pending") {
           if (child.kind === "exec") {
+            const defaults = (ctx as any)?.params?.execDefaults ?? {};
+            const o = {
+              ...defaults,
+              ...((child as any).opts ?? {}),
+            } as ExecOpts;
             commands.push({
               type: "exec",
               name: `${ACT_PREFIX}${cid}`,
               code: JSON.stringify({
-                action: child.name,
+                action: (child as any).name,
                 input: (child as any).input ?? null,
               }),
+              run_after: o.runAfter,
+              idem_key: o.idemKey,
+              max_tries: o.maxTries,
+              retry_delays: o.retryDelays,
             });
           } else if (child.kind === "sleep") {
             commands.push(
@@ -290,13 +316,22 @@ function interpret(
         const cs = slotOf(cid, child);
         if (cs.status === "pending") {
           if (child.kind === "exec") {
+            const defaults = (ctx as any)?.params?.execDefaults ?? {};
+            const o = {
+              ...defaults,
+              ...((child as any).opts ?? {}),
+            } as ExecOpts;
             commands.push({
               type: "exec",
               name: `${ACT_PREFIX}${cid}`,
               code: JSON.stringify({
-                action: child.name,
+                action: (child as any).name,
                 input: (child as any).input ?? null,
               }),
+              run_after: o.runAfter,
+              idem_key: o.idemKey,
+              max_tries: o.maxTries,
+              retry_delays: o.retryDelays,
             });
           } else if (child.kind === "sleep") {
             commands.push(
