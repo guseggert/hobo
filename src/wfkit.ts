@@ -1,6 +1,3 @@
-// wfkit.ts
-// A tiny DSL that lets authors write generator workflows; compiles to engine Commands.
-
 import type { Command, Decider, WFEvent } from "./engine";
 
 export type Effect<T = any> =
@@ -35,10 +32,8 @@ export function defineWorkflow(_name: string, gen: WorkflowGen): Decider {
   return (ctx, history) => interpret(gen, ctx, history);
 }
 
-// ---- Implementation ----
-
-const ACT_PREFIX = "E:"; // activity label/name prefix
-const TIMER_PREFIX = "S:"; // timer label prefix (requires engine to record label on timer events)
+const ACT_PREFIX = "E:";
+const TIMER_PREFIX = "S:";
 
 function IOImpl(): IO {
   return {
@@ -55,12 +50,12 @@ function IOImpl(): IO {
 }
 
 type HistIndex = {
-  execScheduledById: Record<string, string>; // effectId -> taskId
-  execCompletedByTask: Record<string, any>; // taskId   -> result
-  timerScheduledById: Record<string, string>; // effectId -> taskId
-  timerFiredByTask: Record<string, true>; // taskId   -> fired?
+  execScheduledById: Record<string, string>;
+  execCompletedByTask: Record<string, any>;
+  timerScheduledById: Record<string, string>;
+  timerFiredByTask: Record<string, true>;
   signalsByName: Record<string, { ts: string; payload: any }[]>;
-  raceOrder: string[]; // taskIds in completion order
+  raceOrder: string[];
 };
 
 function indexHistory(history: WFEvent[]): HistIndex {
@@ -281,9 +276,14 @@ function interpret(
       }
       break;
     } else if (eff.kind === "race") {
-      // Ensure all children scheduled, then pick the first that completed in history order
       const keyByTask: Record<string, string> = {};
       const keys = Object.keys(eff.options);
+      let sigWinner: {
+        key: string;
+        name: string;
+        value: any;
+        ts: string;
+      } | null = null;
       for (const key of keys) {
         const child = eff.options[key];
         const cid = `${eid}.${key}`;
@@ -314,15 +314,33 @@ function interpret(
             );
           }
         }
-        if (
-          (child.kind === "exec" || child.kind === "sleep") &&
-          cs.status !== "pending" &&
-          (cs as any).taskId
-        ) {
-          keyByTask[(cs as any).taskId] = key;
+        let tid: string | undefined;
+        if (child.kind === "exec") tid = h.execScheduledById[cid];
+        else if (child.kind === "sleep") tid = h.timerScheduledById[cid];
+        if (tid) keyByTask[tid] = key;
+        if (child.kind === "signal") {
+          const name = (child as any).name as string;
+          const consumed = sigCount[name] ?? 0;
+          const list = h.signalsByName[name] ?? [];
+          if (list.length > consumed) {
+            const cand = {
+              key,
+              name,
+              value: list[consumed].payload,
+              ts: list[consumed].ts,
+            };
+            if (!sigWinner || cand.ts < sigWinner.ts) sigWinner = cand;
+          }
         }
       }
-      // Winner = earliest completed task in history order
+      if (sigWinner) {
+        setInternal(
+          `$wf.sigCount.${sigWinner.name}`,
+          (sigCount[sigWinner.name] ?? 0) + 1
+        );
+        input = { key: sigWinner.key, value: sigWinner.value };
+        continue;
+      }
       let winner: { key: string; value: any } | null = null;
       for (const tid of h.raceOrder) {
         const key = keyByTask[tid];

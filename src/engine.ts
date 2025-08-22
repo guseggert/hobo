@@ -1,6 +1,3 @@
-// engine.ts
-// Single-blob workflow engine with CAS, durable timers, activity leases (with fencing tokens).
-
 export type WFStatus = "running" | "completed" | "failed" | "cancelled";
 export type TaskStatus = "pending" | "leased" | "completed" | "failed";
 
@@ -106,13 +103,11 @@ export class ConflictError extends Error {
   }
 }
 
-// ---- Utilities ----
 const now = () => new Date();
 const iso = (d: Date) => d.toISOString();
 const parseISO = (s: string) => new Date(s);
 const addSeconds = (d: Date, s: number) => new Date(d.getTime() + s * 1000);
 
-// ---- Blob store interface (swap with S3/Azure/GCS impl for production) ----
 export interface BlobStore {
   get(key: string): Promise<{ rev: number; state: WFState } | null>;
   put(

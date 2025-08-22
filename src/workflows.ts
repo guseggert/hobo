@@ -1,7 +1,5 @@
-// workflows.ts
 import { defineWorkflow } from "./wfkit";
 
-// 1) Hello loop: increment 3 times with short sleeps between
 export const hello = defineWorkflow("hello", function* (io, params) {
   let i = Number(params?.start ?? 0);
   while (i < 3) {
@@ -13,7 +11,6 @@ export const hello = defineWorkflow("hello", function* (io, params) {
   return yield io.complete({ final: i });
 });
 
-// 2) Approval with deadline (signals + timer)
 export const approval = defineWorkflow("approval", function* (io, params) {
   yield io.set("stage", "awaiting");
   const outcome = yield io.race({
@@ -29,12 +26,10 @@ export const approval = defineWorkflow("approval", function* (io, params) {
   if (outcome.key === "rejected") {
     return yield io.fail("rejected");
   }
-  // deadline
   yield io.exec("escalate", { requestId: params?.requestId });
   return yield io.complete({ escalated: true });
 });
 
-// 3) Fan-out + join, then merge
 export const aggregate = defineWorkflow("aggregate", function* (io, params) {
   const [a, b, c] = yield io.all([
     io.exec("fetchA", { id: params?.id }),
@@ -46,7 +41,6 @@ export const aggregate = defineWorkflow("aggregate", function* (io, params) {
   return yield io.complete(merged);
 });
 
-// 4) Retry demo: call action that fails twice then succeeds
 export const retry = defineWorkflow("retry", function* (io, params) {
   let n = 0;
   while (n < 3) {
@@ -59,28 +53,27 @@ export const retry = defineWorkflow("retry", function* (io, params) {
   return yield io.complete({ n });
 });
 
-// 5) Until date
 export const until = defineWorkflow("until", function* (io) {
   const t = new Date(Date.now() + 100).toISOString();
   yield io.until(t);
   return yield io.complete({ woke: true });
 });
 
-// 6) Race between fast and slow exec
 export const race = defineWorkflow("race", function* (io) {
-  const winner = yield io.race({ fast: io.exec("fast"), slow: io.exec("slow") });
+  const winner = yield io.race({
+    fast: io.exec("fast"),
+    slow: io.exec("slow"),
+  });
   yield io.set("winner", winner.key);
   return yield io.complete(winner);
 });
 
-// 7) all() mix exec + sleep
 export const all_mixed = defineWorkflow("all_mixed", function* (io) {
   const t = new Date(Date.now() + 50).toISOString();
   const [a, _] = yield io.all([io.exec("fast", { v: 2 }), io.until(t)]);
   return yield io.complete({ a });
 });
 
-// 8) Signals multi
 export const signals_multi = defineWorkflow("signals_multi", function* (io) {
   const a = yield io.signal("A");
   const b = yield io.signal("B");

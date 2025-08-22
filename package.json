@@ -29,7 +29,7 @@
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "pnpm run build && pnpm run typecheck",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run"
   },
   "tsup": {
     "entry": [
@@ -46,8 +46,10 @@
     "outDir": "dist"
   },
   "devDependencies": {
+    "@types/node": "^24.3.0",
     "tsup": "^8.5.0",
     "tsx": "^4.20.4",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
   }
 }

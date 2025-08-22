@@ -14,7 +14,10 @@
         "useDefineForClassFields": true,
         "outDir": "dist",
         "rootDir": "src",
-        "types": []
+        "types": [
+            "vitest/globals",
+            "node"
+        ]
     },
     "include": [
         "src"
