@@ -1,3 +1,5 @@
+.terraform
+mise.local.toml
 node_modules
 dist
 .DS_Store
