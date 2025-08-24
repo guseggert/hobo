@@ -1,7 +1,7 @@
 import { S3Client } from "@aws-sdk/client-s3";
 import { SQSClient } from "@aws-sdk/client-sqs";
 import { describe, expect, it } from "vitest";
-import { registerAction } from "../src/actions";
+import { registerActivity } from "../src/activities";
 import { S3BlobStore } from "../src/backends/s3";
 import { SQSWorkQueue } from "../src/backends/sqs";
 import { DeciderRegistry, WorkflowEngine } from "../src/engine";
@@ -11,7 +11,7 @@ import { loadAwsTestConfig } from "./aws.helpers";
 
 const rand = () => Math.random().toString(36).slice(2);
 
-registerAction("fast", (input: any) => ({ ok: true, v: input?.v ?? 1 }));
+registerActivity("fast", (input: any) => ({ ok: true, v: input?.v ?? 1 }));
 
 describe("aws e2e", () => {
   it("s3: workflow completes using S3BlobStore", async () => {

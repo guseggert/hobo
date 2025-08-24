@@ -1,3 +1,6 @@
+import { HoboError, HoboErrorObject, HoboErrorObjectType } from "./errors";
+import type { EventStore, TaskStore } from "./model";
+
 export type WFStatus = "running" | "completed" | "failed" | "cancelled";
 export type TaskStatus = "pending" | "leased" | "completed" | "failed";
 
@@ -8,7 +11,7 @@ export interface EventBase {
 export type WFEvent =
   | (EventBase & { type: "WF_CREATED" })
   | (EventBase & { type: "WF_COMPLETED" })
-  | (EventBase & { type: "WF_FAILED"; reason?: string })
+  | (EventBase & { type: "WF_FAILED"; reason?: HoboErrorObjectType })
   | (EventBase & {
       type: "TIMER_SCHEDULED";
       task_id: string;
@@ -18,7 +21,11 @@ export type WFEvent =
   | (EventBase & { type: "TIMER_FIRED"; task_id: string; label?: string })
   | (EventBase & { type: "ACTIVITY_SCHEDULED"; task_id: string; name: string })
   | (EventBase & { type: "ACTIVITY_COMPLETED"; task_id: string; result?: any })
-  | (EventBase & { type: "ACTIVITY_FAILED"; task_id: string; error: any })
+  | (EventBase & {
+      type: "ACTIVITY_FAILED";
+      task_id: string;
+      error: HoboErrorObjectType;
+    })
   | (EventBase & {
       type: "ACTIVITY_RETRY";
       task_id: string;
@@ -39,7 +46,7 @@ export interface BaseTask {
   status: TaskStatus;
   run_after: string;
   result?: any;
-  error?: any;
+  error?: HoboErrorObjectType;
 }
 
 export interface SleepTask extends BaseTask {
@@ -50,13 +57,18 @@ export interface SleepTask extends BaseTask {
 export interface ExecTask extends BaseTask {
   type: "exec";
   name?: string;
-  code: string; // opaque payload for your workers (we'll use named actions)
+  code: string; // opaque payload for your workers (we'll use named activities)
   lease?: Lease | null;
   tries?: number;
   max_tries?: number;
   idem_key?: string;
   fence?: number; // monotonic counter for lease tokens
   retry_delays?: number[];
+  // fields to support external task stores
+  kind?: "activity";
+  createdAt?: string;
+  updatedAt?: string;
+  version?: string;
 }
 
 export type Task = SleepTask | ExecTask;
@@ -78,6 +90,7 @@ export interface WFState {
 
   decider: string;
   signals?: Array<{ ts: string; name: string; payload: any }>;
+  last_seq?: number;
 }
 
 export type Command =
@@ -93,18 +106,14 @@ export type Command =
     }
   | { type: "set"; key: string; value: any }
   | { type: "complete_workflow" }
-  | { type: "fail_workflow"; reason?: string };
+  | { type: "fail_workflow"; reason?: unknown };
 
 export type Decider = (
   ctx: Record<string, any>,
   history: WFEvent[]
 ) => Command[];
 
-export class ConflictError extends Error {
-  constructor(msg = "Revision conflict") {
-    super(msg);
-  }
-}
+// Conflict errors are modeled via HoboError with type: "conflict".
 
 const now = () => new Date();
 const iso = (d: Date) => d.toISOString();
@@ -113,14 +122,20 @@ const addSeconds = (d: Date, s: number) => new Date(d.getTime() + s * 1000);
 
 export interface BlobStore {
   get(
+    signal: AbortSignal,
     key: string
   ): Promise<{ rev: number; state: WFState; cas?: string } | null>;
-  put(key: string, state: WFState, cas?: string | null): Promise<number>; // returns new rev
+  put(
+    signal: AbortSignal,
+    key: string,
+    state: WFState,
+    cas?: string | null
+  ): Promise<number>; // returns new rev
 }
 
 export class InMemoryBlobStore implements BlobStore {
   private db = new Map<string, { rev: number; blob: string; cas: string }>();
-  async get(key: string) {
+  async get(_signal: AbortSignal, key: string) {
     const rec = this.db.get(key);
     if (!rec) return null;
     return {
@@ -129,16 +144,22 @@ export class InMemoryBlobStore implements BlobStore {
       cas: rec.cas,
     };
   }
-  async put(key: string, state: WFState, cas: string | null = null) {
+  async put(
+    _signal: AbortSignal,
+    key: string,
+    state: WFState,
+    cas: string | null = null
+  ) {
     const rec = this.db.get(key);
     if (!rec) {
-      if (cas !== null) throw new ConflictError("No record");
+      if (cas !== null) throw HoboError.conflict("No record");
       const rev = 1;
       const newRec = { rev, blob: JSON.stringify(state), cas: `r${rev}` };
       this.db.set(key, newRec);
       return rev;
     }
-    if (cas === null || cas !== rec.cas) throw new ConflictError();
+    if (cas === null || cas !== rec.cas)
+      throw HoboError.conflict("CAS mismatch");
     const rev = rec.rev + 1;
     rec.rev = rev;
     rec.cas = `r${rev}`;
@@ -162,9 +183,15 @@ export class DeciderRegistry {
 
 // ---- Engine ----
 export class WorkflowEngine {
-  constructor(private store: BlobStore, private deciders: DeciderRegistry) {}
+  constructor(
+    private store: BlobStore,
+    private deciders: DeciderRegistry,
+    private taskStore?: TaskStore<any>,
+    private eventStore?: EventStore<WFEvent>
+  ) {}
 
   async create(
+    signal: AbortSignal,
     wfId: string,
     deciderName: string,
     initialCtx: Record<string, any> = {}
@@ -177,34 +204,38 @@ export class WorkflowEngine {
       created_at: iso(t),
       updated_at: iso(t),
       ctx: { ...initialCtx },
-      history: [{ ts: iso(t), type: "WF_CREATED" }],
+      history: [],
       tasks: {},
       need_decide: true,
       next_wake: null,
       seq: 0,
       decider: deciderName,
+      last_seq: 0,
     };
-    await this.store.put(wfId, s, null);
+    await this.store.put(signal, wfId, s, null);
+    await this.logEvent(signal, s, { ts: iso(t), type: "WF_CREATED" });
+    const got = await this.store.get(signal, wfId);
+    await this.store.put(signal, wfId, s, got?.cas ?? null);
     return s;
   }
 
-  async tick(wfId: string, tNow: Date = now()) {
+  async tick(signal: AbortSignal, wfId: string, tNow: Date = now()) {
     // CAS retry loop
     for (;;) {
-      const got = await this.store.get(wfId);
+      const got = await this.store.get(signal, wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s, cas } = got as any;
+      const { state: s, cas } = got;
 
       // 1) Fire due timers
-      for (const task of Object.values(s.tasks as Record<string, Task>)) {
+      for (const task of Object.values(s.tasks)) {
         if (task.type === "sleep" && task.status === "pending") {
           if (parseISO(task.run_after) <= tNow) {
             task.status = "completed";
-            s.history.push({
+            await this.logEvent(signal, s, {
               ts: iso(tNow),
               type: "TIMER_FIRED",
               task_id: task.id,
-              label: (task as SleepTask).label,
+              label: task.label,
             });
             s.need_decide = true;
           }
@@ -214,7 +245,7 @@ export class WorkflowEngine {
       // 2) Decider
       if (s.status === "running" && s.need_decide) {
         const cmds = this.deciders.get(s.decider)(s.ctx, s.history);
-        this.applyCommands(s, cmds, tNow);
+        await this.applyCommands(signal, s, cmds, tNow);
         s.need_decide = false;
       }
 
@@ -223,20 +254,21 @@ export class WorkflowEngine {
       s.updated_at = iso(tNow);
 
       try {
-        const newRev = await this.store.put(wfId, s, cas ?? null);
+        const newRev = await this.store.put(signal, wfId, s, cas ?? null);
         return {
           rev: newRev,
           next_wake: s.next_wake,
-          status: s.status as WFStatus,
+          status: s.status,
         };
       } catch (e) {
-        if (e instanceof ConflictError) continue;
+        if (e instanceof HoboError && e.obj.type === "conflict") continue;
         throw e;
       }
     }
   }
 
   async reserveReadyActivities(
+    signal: AbortSignal,
     wfId: string,
     workerId: string,
     maxN = 1,
@@ -244,13 +276,13 @@ export class WorkflowEngine {
     tNow: Date = now()
   ): Promise<ExecTask[]> {
     for (;;) {
-      const got = await this.store.get(wfId);
+      const got = await this.store.get(signal, wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s, cas } = got as any;
+      const { state: s, cas } = got;
 
       const leased: ExecTask[] = [];
-      const tasks = Object.values(s.tasks as Record<string, Task>).sort(
-        (a, b) => a.id.localeCompare(b.id)
+      const tasks = Object.values(s.tasks).sort((a, b) =>
+        a.id.localeCompare(b.id)
       );
       for (const tsk of tasks) {
         if (tsk.type !== "exec") continue;
@@ -258,24 +290,21 @@ export class WorkflowEngine {
 
         // if leased, check expiry
         if (tsk.status === "leased") {
-          if (
-            (tsk as ExecTask).lease &&
-            parseISO((tsk as ExecTask).lease!.expires_at) > tNow
-          )
-            continue; // still leased
+          const lease = tsk.lease;
+          if (lease && parseISO(lease.expires_at) > tNow) continue; // still leased
         }
 
         // pending and due?
         if (parseISO(tsk.run_after) <= tNow) {
           tsk.status = "leased";
-          const nextToken = ((tsk as ExecTask).fence ?? 0) + 1;
-          (tsk as ExecTask).fence = nextToken;
-          (tsk as ExecTask).lease = {
+          const nextToken = (tsk.fence ?? 0) + 1;
+          tsk.fence = nextToken;
+          tsk.lease = {
             owner: workerId,
             token: nextToken,
             expires_at: iso(addSeconds(tNow, leaseSecs)),
           };
-          leased.push(tsk as ExecTask);
+          leased.push(tsk);
           if (leased.length >= maxN) break;
         }
       }
@@ -283,10 +312,10 @@ export class WorkflowEngine {
       if (!leased.length) return [];
 
       try {
-        await this.store.put(wfId, s, cas ?? null);
+        await this.store.put(signal, wfId, s, cas ?? null);
         return JSON.parse(JSON.stringify(leased)) as ExecTask[]; // deep copy
       } catch (e) {
-        if (e instanceof ConflictError) continue;
+        if (e instanceof HoboError && e.obj.type === "conflict") continue;
         throw e;
       }
     }
@@ -297,6 +326,7 @@ export class WorkflowEngine {
    * Returns { already: true } if task is already terminal (idempotent).
    */
   async completeActivity(
+    signal: AbortSignal,
     wfId: string,
     taskId: string,
     success: boolean,
@@ -305,14 +335,14 @@ export class WorkflowEngine {
     tNow: Date = now()
   ): Promise<{ rev: number; status: WFStatus; already?: true }> {
     for (;;) {
-      const got = await this.store.get(wfId);
+      const got = await this.store.get(signal, wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s, cas } = got as any;
+      const { state: s, cas } = got;
 
       const t = s.tasks[taskId] as ExecTask | undefined;
-      if (!t) return { rev, status: s.status as WFStatus, already: true };
+      if (!t) return { rev: got.rev, status: s.status, already: true };
       if (t.status === "completed" || t.status === "failed")
-        return { rev, status: s.status as WFStatus, already: true };
+        return { rev: got.rev, status: s.status, already: true };
 
       // Fencing guard
       if (
@@ -321,13 +351,13 @@ export class WorkflowEngine {
         (leaseToken !== undefined && t.lease.token !== leaseToken)
       ) {
         // Stale or not yours; ignore safely
-        return { rev, status: s.status as WFStatus, already: true };
+        return { rev: got.rev, status: s.status, already: true };
       }
 
       if (success) {
         t.status = "completed";
         t.result = resultOrError;
-        s.history.push({
+        await this.logEvent(signal, s, {
           ts: iso(tNow),
           type: "ACTIVITY_COMPLETED",
           task_id: t.id,
@@ -335,25 +365,39 @@ export class WorkflowEngine {
         });
       } else {
         t.tries = (t.tries ?? 0) + 1;
-        t.error = resultOrError;
+        let err: HoboErrorObjectType;
+        if (resultOrError instanceof HoboError) err = resultOrError.toJSON();
+        else {
+          try {
+            err = HoboErrorObject.parse(resultOrError);
+          } catch {
+            err = {
+              type: "non_retryable",
+              message: String(
+                (resultOrError as { message?: string })?.message ??
+                  resultOrError
+              ),
+              cause: undefined,
+            };
+          }
+        }
+        t.error = err;
         if (t.tries >= (t.max_tries ?? 3)) {
           t.status = "failed";
-          s.history.push({
+          await this.logEvent(signal, s, {
             ts: iso(tNow),
             type: "ACTIVITY_FAILED",
             task_id: t.id,
-            error: t.error,
+            error: err,
           });
           s.status = "failed";
         } else {
-          const del = (t.retry_delays && t.retry_delays[t.tries - 1]) as
-            | number
-            | undefined;
+          const del = t.retry_delays?.[t.tries - 1];
           const backoff = del ?? Math.min(300, 2 ** t.tries);
           t.status = "pending";
           t.lease = null;
           t.run_after = iso(addSeconds(tNow, backoff));
-          s.history.push({
+          await this.logEvent(signal, s, {
             ts: iso(tNow),
             type: "ACTIVITY_RETRY",
             task_id: t.id,
@@ -365,10 +409,10 @@ export class WorkflowEngine {
       s.updated_at = iso(tNow);
 
       try {
-        const newRev = await this.store.put(wfId, s, cas ?? null);
-        return { rev: newRev, status: s.status as WFStatus };
+        const newRev = await this.store.put(signal, wfId, s, cas ?? null);
+        return { rev: newRev, status: s.status };
       } catch (e) {
-        if (e instanceof ConflictError) continue;
+        if (e instanceof HoboError && e.obj.type === "conflict") continue;
         throw e;
       }
     }
@@ -376,6 +420,7 @@ export class WorkflowEngine {
 
   /** Extend an active lease (heartbeat). Throws if not leased by `owner` with `token`. */
   async extendLease(
+    signal: AbortSignal,
     wfId: string,
     taskId: string,
     owner: string,
@@ -384,9 +429,9 @@ export class WorkflowEngine {
     tNow: Date = now()
   ) {
     for (;;) {
-      const got = await this.store.get(wfId);
+      const got = await this.store.get(signal, wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s, cas } = got as any;
+      const { state: s, cas } = got;
       const t = s.tasks[taskId] as ExecTask | undefined;
       if (!t || t.type !== "exec" || t.status !== "leased" || !t.lease)
         throw new Error("not leased");
@@ -396,44 +441,68 @@ export class WorkflowEngine {
       if (currentExp < tNow) throw new Error("lease expired");
       t.lease.expires_at = iso(addSeconds(currentExp, extraSeconds));
       try {
-        await this.store.put(wfId, s, cas ?? null);
+        await this.store.put(signal, wfId, s, cas ?? null);
         return;
       } catch (e) {
-        if (e instanceof ConflictError) continue;
+        if (e instanceof HoboError && e.obj.type === "conflict") continue;
         throw e;
       }
     }
   }
 
-  async signal(wfId: string, name: string, payload: any, tNow: Date = now()) {
+  async signal(
+    signal: AbortSignal,
+    wfId: string,
+    name: string,
+    payload: any,
+    tNow: Date = now()
+  ) {
     for (;;) {
-      const got = await this.store.get(wfId);
+      const got = await this.store.get(signal, wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s, cas } = got as any;
+      const { state: s, cas } = got;
       s.signals ??= [];
       s.signals.push({ ts: iso(tNow), name, payload });
-      s.history.push({ ts: iso(tNow), type: "SIGNAL", name, payload });
+      await this.logEvent(signal, s, {
+        ts: iso(tNow),
+        type: "SIGNAL",
+        name,
+        payload,
+      });
       s.need_decide = true;
       s.updated_at = iso(tNow);
       try {
-        const newRev = await this.store.put(wfId, s, cas ?? null);
+        const newRev = await this.store.put(signal, wfId, s, cas ?? null);
         return { rev: newRev };
       } catch (e) {
-        if (e instanceof ConflictError) continue;
+        if (e instanceof HoboError && e.obj.type === "conflict") continue;
         throw e;
       }
     }
   }
 
   // ---- helpers ----
-  private applyCommands(s: WFState, cmds: Command[], tNow: Date) {
+  private async applyCommands(
+    signal: AbortSignal,
+    s: WFState,
+    cmds: Command[],
+    tNow: Date
+  ) {
     for (const c of cmds) {
       switch (c.type) {
         case "sleep":
-          this.scheduleSleep(s, tNow, c.seconds, c.until, c.label);
+          await this.scheduleSleep(
+            signal,
+            s,
+            tNow,
+            c.seconds,
+            c.until,
+            c.label
+          );
           break;
         case "exec":
-          this.scheduleExec(
+          await this.scheduleExec(
+            signal,
             s,
             tNow,
             c.name,
@@ -446,20 +515,45 @@ export class WorkflowEngine {
           break;
         case "set":
           this.setPath(s.ctx, c.key, c.value);
-          s.history.push({ ts: iso(tNow), type: "CTX_SET", key: c.key });
+          await this.logEvent(signal, s, {
+            ts: iso(tNow),
+            type: "CTX_SET",
+            key: c.key,
+          });
           break;
         case "complete_workflow":
           s.status = "completed";
-          s.history.push({ ts: iso(tNow), type: "WF_COMPLETED" });
-          break;
-        case "fail_workflow":
-          s.status = "failed";
-          s.history.push({
+          await this.logEvent(signal, s, {
             ts: iso(tNow),
-            type: "WF_FAILED",
-            reason: c.reason,
+            type: "WF_COMPLETED",
           });
           break;
+        case "fail_workflow": {
+          s.status = "failed";
+          let err: HoboErrorObjectType;
+          const input = c.reason;
+          if (input instanceof HoboError) err = input.toJSON();
+          else {
+            try {
+              err = HoboErrorObject.parse(input);
+            } catch {
+              err = {
+                type: "non_retryable",
+                message:
+                  input !== undefined
+                    ? String((input as { message?: string })?.message ?? input)
+                    : "workflow failed",
+                cause: undefined,
+              };
+            }
+          }
+          await this.logEvent(signal, s, {
+            ts: iso(tNow),
+            type: "WF_FAILED",
+            reason: err,
+          });
+          break;
+        }
       }
     }
   }
@@ -469,7 +563,8 @@ export class WorkflowEngine {
     return `t${String(s.seq).padStart(6, "0")}`;
   }
 
-  private scheduleSleep(
+  private async scheduleSleep(
+    signal: AbortSignal,
     s: WFState,
     tNow: Date,
     seconds?: number,
@@ -490,7 +585,7 @@ export class WorkflowEngine {
       label,
     };
     s.tasks[id] = task;
-    s.history.push({
+    await this.logEvent(signal, s, {
       ts: iso(tNow),
       type: "TIMER_SCHEDULED",
       task_id: id,
@@ -499,7 +594,8 @@ export class WorkflowEngine {
     });
   }
 
-  private scheduleExec(
+  private async scheduleExec(
+    signal: AbortSignal,
     s: WFState,
     tNow: Date,
     name: string | undefined,
@@ -524,9 +620,16 @@ export class WorkflowEngine {
       fence: 0,
     };
     if (retry_delays && Array.isArray(retry_delays))
-      (task as any).retry_delays = retry_delays.slice();
-    s.tasks[id] = task;
-    s.history.push({
+      task.retry_delays = retry_delays.slice();
+    // populate external-store friendly fields
+    task.kind = "activity";
+    task.createdAt = iso(tNow);
+    task.updatedAt = iso(tNow);
+    task.version = "0";
+    if (this.taskStore) {
+      await this.taskStore.put(signal, s.id, id, task, undefined);
+    }
+    await this.logEvent(signal, s, {
       ts: iso(tNow),
       type: "ACTIVITY_SCHEDULED",
       task_id: id,
@@ -558,5 +661,13 @@ export class WorkflowEngine {
       p = p[k];
     }
     p[parts[0]] = value;
+  }
+  private async logEvent(signal: AbortSignal, s: WFState, ev: WFEvent) {
+    s.history.push(ev);
+    if (this.eventStore) {
+      const next = (s.last_seq ?? 0) + 1;
+      await this.eventStore.put(signal, s.id, next, ev);
+      s.last_seq = next;
+    }
   }
 }

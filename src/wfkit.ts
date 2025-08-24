@@ -1,6 +1,6 @@
 import type { Command, Decider, WFEvent } from "./engine";
 
-export type Effect<T = any> =
+export type Effect<T = any> = (
   | { kind: "exec"; name: string; input?: any; opts?: ExecOpts }
   | { kind: "sleep"; seconds?: number; until?: string }
   | { kind: "signal"; name: string }
@@ -8,7 +8,8 @@ export type Effect<T = any> =
   | { kind: "race"; options: Record<string, Effect<any>> }
   | { kind: "set"; key: string; value: any }
   | { kind: "complete"; value?: any }
-  | { kind: "fail"; reason?: string };
+  | { kind: "fail"; reason?: string }
+) & { __t?: T };
 
 export type ExecOpts = {
   maxTries?: number;
@@ -67,36 +68,42 @@ type HistIndex = {
 
 function indexHistory(history: WFEvent[]): HistIndex {
   const execScheduledById: Record<string, string> = {};
-  const execCompletedByTask: Record<string, any> = {};
+  const execCompletedByTask: Record<string, unknown> = {};
   const timerScheduledById: Record<string, string> = {};
   const timerFiredByTask: Record<string, true> = {};
-  const signalsByName: Record<string, { ts: string; payload: any }[]> = {};
+  const signalsByName: Record<string, { ts: string; payload: unknown }[]> = {};
   const raceOrder: string[] = [];
 
   for (const e of history) {
     if (e.type === "ACTIVITY_SCHEDULED") {
-      const name = (e as any).name as string | undefined;
+      const name = (e as WFEvent & { name?: string }).name;
       if (name && name.startsWith(ACT_PREFIX)) {
         const effectId = name.substring(ACT_PREFIX.length);
-        execScheduledById[effectId] = (e as any).task_id;
+        execScheduledById[effectId] = (
+          e as WFEvent & { task_id: string }
+        ).task_id;
       }
     } else if (e.type === "ACTIVITY_COMPLETED") {
-      execCompletedByTask[(e as any).task_id] = (e as any).result;
-      raceOrder.push((e as any).task_id);
+      execCompletedByTask[(e as WFEvent & { task_id: string }).task_id] = (
+        e as WFEvent & { result?: unknown }
+      ).result;
+      raceOrder.push((e as WFEvent & { task_id: string }).task_id);
     } else if (e.type === "TIMER_SCHEDULED") {
-      const label = (e as any).label as string | undefined;
+      const label = (e as WFEvent & { label?: string }).label;
       if (label && label.startsWith(TIMER_PREFIX)) {
         const effectId = label.substring(TIMER_PREFIX.length);
-        timerScheduledById[effectId] = (e as any).task_id;
+        timerScheduledById[effectId] = (
+          e as WFEvent & { task_id: string }
+        ).task_id;
       }
     } else if (e.type === "TIMER_FIRED") {
-      timerFiredByTask[(e as any).task_id] = true;
-      raceOrder.push((e as any).task_id);
+      timerFiredByTask[(e as WFEvent & { task_id: string }).task_id] = true;
+      raceOrder.push((e as WFEvent & { task_id: string }).task_id);
     } else if (e.type === "SIGNAL") {
-      const name = (e as any).name as string;
+      const name = (e as WFEvent & { name: string }).name;
       (signalsByName[name] ??= []).push({
-        ts: (e as any).ts,
-        payload: (e as any).payload,
+        ts: (e as WFEvent).ts,
+        payload: (e as WFEvent & { payload?: unknown }).payload,
       });
     }
   }
@@ -124,22 +131,25 @@ function interpret(
     suffix ? `${cursor}${suffix}` : `${cursor}`;
 
   // signal consumption offsets
-  const sigCount: Record<string, number> = (ctx.$wf?.sigCount ?? {}) as any;
+  const sigCount: Record<string, number> = (ctx.$wf?.sigCount ?? {}) as Record<
+    string,
+    number
+  >;
 
   // Commands to emit
   const setCmds: Command[] = [];
   const commands: Command[] = [];
 
   // local mutation helper (also stage into setCmds)
-  const setInternal = (key: string, value: any) => {
+  const setInternal = (key: string, value: unknown) => {
     setCmds.push({ type: "set", key, value });
     // mutate local mirror for subsequent steps in this same tick
     const parts = key.split(".");
-    let p: any = ctx;
+    let p: Record<string, unknown> = ctx as Record<string, unknown>;
     while (parts.length > 1) {
       const k = parts.shift()!;
-      p[k] ??= {};
-      p = p[k];
+      if (p[k] === undefined) p[k] = {} as unknown;
+      p = p[k] as Record<string, unknown>;
     }
     p[parts[0]] = value;
   };
@@ -151,7 +161,7 @@ function interpret(
       if (!taskId) return { status: "pending" as const };
       const done = h.execCompletedByTask[taskId];
       return done !== undefined
-        ? { status: "done" as const, value: done }
+        ? { status: "done" as const, value: done as unknown }
         : { status: "waiting" as const, taskId };
     } else if (eff.kind === "sleep") {
       const taskId = h.timerScheduledById[id];
@@ -164,8 +174,8 @@ function interpret(
   };
 
   // run the generator; feed results for ready steps; stop when we must wait
-  const iter = gen(io, ctx.params);
-  let input: any = undefined;
+  const iter = gen(io, (ctx as { params?: unknown })?.params);
+  let input: unknown = undefined;
 
   // restore cursor at start of turn
   if (cursor === 0 && !ctx.$wf)
@@ -195,10 +205,12 @@ function interpret(
       }
       if (s.status === "pending") {
         const code = JSON.stringify({
-          action: eff.name,
+          activity: eff.name,
           input: eff.input ?? null,
         });
-        const defaults = (ctx as any)?.params?.execDefaults ?? {};
+        const defaults =
+          (ctx as { params?: { execDefaults?: ExecOpts } })?.params
+            ?.execDefaults ?? {};
         const o = { ...defaults, ...(eff.opts ?? {}) } as ExecOpts;
         commands.push({
           type: "exec",
@@ -257,17 +269,16 @@ function interpret(
         const cs = slotOf(cid, child);
         if (cs.status === "pending") {
           if (child.kind === "exec") {
-            const defaults = (ctx as any)?.params?.execDefaults ?? {};
-            const o = {
-              ...defaults,
-              ...((child as any).opts ?? {}),
-            } as ExecOpts;
+            const defaults =
+              (ctx as { params?: { execDefaults?: ExecOpts } })?.params
+                ?.execDefaults ?? {};
+            const o = { ...defaults, ...(child.opts ?? {}) } as ExecOpts;
             commands.push({
               type: "exec",
               name: `${ACT_PREFIX}${cid}`,
               code: JSON.stringify({
-                action: (child as any).name,
-                input: (child as any).input ?? null,
+                activity: child.name,
+                input: (child as { input?: unknown }).input ?? null,
               }),
               run_after: o.runAfter,
               idem_key: o.idemKey,
@@ -276,15 +287,15 @@ function interpret(
             });
           } else if (child.kind === "sleep") {
             commands.push(
-              (child as any).until
+              child.until
                 ? {
                     type: "sleep",
-                    until: (child as any).until,
+                    until: child.until,
                     label: `${TIMER_PREFIX}${cid}`,
                   }
                 : {
                     type: "sleep",
-                    seconds: (child as any).seconds ?? 0,
+                    seconds: child.seconds ?? 0,
                     label: `${TIMER_PREFIX}${cid}`,
                   }
             );
@@ -293,7 +304,10 @@ function interpret(
         } else if (cs.status === "waiting") {
           allDone = false;
         } else if (cs.status === "done") {
-          results[i] = child.kind === "exec" ? (cs as any).value : undefined;
+          results[i] =
+            child.kind === "exec"
+              ? (cs as { value?: unknown }).value
+              : undefined;
         }
       }
       if (allDone) {
@@ -316,17 +330,16 @@ function interpret(
         const cs = slotOf(cid, child);
         if (cs.status === "pending") {
           if (child.kind === "exec") {
-            const defaults = (ctx as any)?.params?.execDefaults ?? {};
-            const o = {
-              ...defaults,
-              ...((child as any).opts ?? {}),
-            } as ExecOpts;
+            const defaults =
+              (ctx as { params?: { execDefaults?: ExecOpts } })?.params
+                ?.execDefaults ?? {};
+            const o = { ...defaults, ...(child.opts ?? {}) } as ExecOpts;
             commands.push({
               type: "exec",
               name: `${ACT_PREFIX}${cid}`,
               code: JSON.stringify({
-                action: (child as any).name,
-                input: (child as any).input ?? null,
+                activity: (child as { name: string }).name,
+                input: (child as { input?: unknown }).input ?? null,
               }),
               run_after: o.runAfter,
               idem_key: o.idemKey,
@@ -335,15 +348,15 @@ function interpret(
             });
           } else if (child.kind === "sleep") {
             commands.push(
-              (child as any).until
+              child.until
                 ? {
                     type: "sleep",
-                    until: (child as any).until,
+                    until: child.until,
                     label: `${TIMER_PREFIX}${cid}`,
                   }
                 : {
                     type: "sleep",
-                    seconds: (child as any).seconds ?? 0,
+                    seconds: child.seconds ?? 0,
                     label: `${TIMER_PREFIX}${cid}`,
                   }
             );
@@ -354,7 +367,7 @@ function interpret(
         else if (child.kind === "sleep") tid = h.timerScheduledById[cid];
         if (tid) keyByTask[tid] = key;
         if (child.kind === "signal") {
-          const name = (child as any).name as string;
+          const name = (child as { name: string }).name;
           const consumed = sigCount[name] ?? 0;
           const list = h.signalsByName[name] ?? [];
           if (list.length > consumed) {
@@ -386,7 +399,10 @@ function interpret(
         if (cs.status === "done") {
           winner = {
             key,
-            value: child.kind === "exec" ? (cs as any).value : undefined,
+            value:
+              child.kind === "exec"
+                ? (cs as { value?: unknown }).value
+                : undefined,
           };
           break;
         }

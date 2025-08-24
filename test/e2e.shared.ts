@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { registerAction } from "../src/actions";
+import { registerActivity } from "../src/activities";
 import { DeciderRegistry, WorkflowEngine, type BlobStore } from "../src/engine";
 import { WorkflowRunner } from "../src/runner";
 import { defineWorkflow } from "../src/wfkit";
@@ -12,7 +12,7 @@ import {
   retry,
   signals_multi,
   until,
-} from "../src/workflows";
+} from "./helpers/workflows";
 
 // async function drainExecs(
 //   engine: WorkflowEngine,
@@ -36,7 +36,7 @@ import {
 //       let ok = false;
 //       let res: any;
 //       try {
-//         res = await runTask(t, ctx);
+//         res = await runActivity(t, ctx);
 //         ok = true;
 //       } catch (e: any) {
 //         res = { message: String(e?.message ?? e) };
@@ -92,42 +92,45 @@ export function registerE2ESuite(
   const rid = () => Math.random().toString(36).slice(2);
   const uid = (base: string) => `${base}_${label}_${rid()}`;
 
-  registerAction("increment", (input: any, ctx: Record<string, any>) => {
+  registerActivity("increment", (input: any, ctx: Record<string, any>) => {
     return { label: "inc", to: input?.to ?? Number(ctx.i ?? 0) + 1 };
   });
-  registerAction("fulfill", async (input: any) => {
+  registerActivity("fulfill", async (input: any) => {
     return { label: "fulfill", ok: true, requestId: input?.requestId };
   });
-  registerAction("escalate", async (input: any) => {
+  registerActivity("escalate", async (input: any) => {
     return { label: "escalated", requestId: input?.requestId };
   });
-  registerAction("fetchA", async (input: any) => ({
+  registerActivity("fetchA", async (input: any) => ({
     label: "fetchA",
     data: 1,
     id: input?.id,
   }));
-  registerAction("fetchB", async (input: any) => ({
+  registerActivity("fetchB", async (input: any) => ({
     label: "fetchB",
     data: 2,
     id: input?.id,
   }));
-  registerAction("fetchC", async (input: any) => ({
+  registerActivity("fetchC", async (input: any) => ({
     label: "fetchC",
     data: 3,
     id: input?.id,
   }));
-  registerAction("merge", async (input: any) => {
+  registerActivity("merge", async (input: any) => {
     const { a, b, c } = input ?? {};
     return {
       label: "merge",
       sum: (a?.data ?? 0) + (b?.data ?? 0) + (c?.data ?? 0),
     };
   });
-  registerAction("always_fail", () => {
+  registerActivity("always_fail", () => {
     throw new Error("boom");
   });
-  registerAction("fast", (input: any) => ({ label: "fast", v: input?.v ?? 1 }));
-  registerAction("slow", async (input: any) => {
+  registerActivity("fast", (input: any) => ({
+    label: "fast",
+    v: input?.v ?? 1,
+  }));
+  registerActivity("slow", async (input: any) => {
     await new Promise((r) => setTimeout(r, 10));
     return { label: "slow", v: input?.v ?? 1 };
   });
@@ -185,7 +188,7 @@ export function registerE2ESuite(
       expect(res).toBe("failed");
     });
 
-    it("always_fails action leads to workflow failure after retries", async () => {
+    it("always_fails activity leads to workflow failure after retries", async () => {
       const reg = new DeciderRegistry();
       reg.register(
         "demo:always_fails",
@@ -201,12 +204,12 @@ export function registerE2ESuite(
       expect(res).toBe("failed");
     });
 
-    it("unknown action fails after retries", async () => {
+    it("unknown activity fails after retries", async () => {
       const reg = new DeciderRegistry();
       reg.register(
         "demo:unknown",
         defineWorkflow("unknown", function* (io) {
-          yield io.exec("missing_action");
+          yield io.exec("missing_activity");
           return yield io.complete();
         })
       );

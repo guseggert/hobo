@@ -1,4 +1,4 @@
-import { defineWorkflow } from "./wfkit";
+import { defineWorkflow } from "../../src/wfkit";
 
 export const hello = defineWorkflow("hello", function* (io, params) {
   let i = Number(params?.start ?? 0);

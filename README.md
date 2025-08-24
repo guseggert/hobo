@@ -11,6 +11,20 @@ There are otherwise no servers nor infrastructure to manage, outside of your wor
 
 Hobo clients in various languages can safely interact with each other, even within the same workflow.
 
+## Entities
+
+- Workflow: distributed control flow
+- Activity: a unit of potentially-side-effecting work
+- Task
+  - Decision Task: a specific execution of work for evaluating control flow
+  - Activity Task: a specific execution of an activity
+- Store: the place where workflow and activity state is tracked
+- Queue: the mechanism used for ensuring that tasks are distributed to
+- Worker: a process that receives nudges to carry out task executions from the queue, updating state and scheduling further tasks as necessary
+- State
+  - Decision state: stores control flow state, including an event log for idempotency, worker leases, workflow metadata, etc.
+  - Task state: stores task state such as input, output, scheduling information like retries, worker leases, etc.
+
 ### Core
 
 ### TypeScript
@@ -37,10 +51,10 @@ import {
 } from "./src/engine";
 import { WorkflowRunner } from "./src/runner";
 import { defineWorkflow } from "./src/wfkit";
-import { registerAction } from "./src/actions";
+import { registerActivity } from "./src/activities";
 
-// Register an action to perform work
-registerAction("greet", async (input: any) => ({
+// Register an activity to perform work
+registerActivity("greet", async (input: any) => ({
   message: `hi ${input?.name ?? "hobo"}`,
 }));
 

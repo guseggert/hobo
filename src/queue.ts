@@ -4,10 +4,11 @@ export interface WorkMessage<T = any> {
 }
 
 export interface WorkQueue<T = any> {
-  send(msg: T): Promise<void>;
+  send(signal: AbortSignal, msg: T): Promise<void>;
   receive(
+    signal: AbortSignal,
     maxMessages?: number,
     waitSeconds?: number
   ): Promise<WorkMessage<T>[]>;
-  delete(id: string, receipt?: string): Promise<void>;
+  delete(signal: AbortSignal, id: string, receipt?: string): Promise<void>;
 }
