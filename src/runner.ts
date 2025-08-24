@@ -1,9 +1,14 @@
 import { runTask } from "./actions";
 import type { BlobStore, ExecTask, WFStatus } from "./engine";
 import { WorkflowEngine } from "./engine";
+import type { WorkQueue } from "./queue";
 
 export class WorkflowRunner {
-  constructor(private engine: WorkflowEngine, private store: BlobStore) {}
+  constructor(
+    private engine: WorkflowEngine,
+    private store: BlobStore,
+    private queue?: WorkQueue
+  ) {}
 
   async drainExecs(
     wfId: string,
@@ -18,6 +23,9 @@ export class WorkflowRunner {
         maxPerPass,
         leaseSecs
       );
+      if (this.queue && leased.length) {
+        for (const t of leased) await this.queue.send({ wfId, taskId: t.id });
+      }
       if (!leased.length) return;
       for (const t of leased) {
         let ok = false;

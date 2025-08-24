@@ -112,34 +112,36 @@ const parseISO = (s: string) => new Date(s);
 const addSeconds = (d: Date, s: number) => new Date(d.getTime() + s * 1000);
 
 export interface BlobStore {
-  get(key: string): Promise<{ rev: number; state: WFState } | null>;
-  put(
-    key: string,
-    state: WFState,
-    expectedRev?: number | null
-  ): Promise<number>; // returns new rev
+  get(
+    key: string
+  ): Promise<{ rev: number; state: WFState; cas?: string } | null>;
+  put(key: string, state: WFState, cas?: string | null): Promise<number>; // returns new rev
 }
 
 export class InMemoryBlobStore implements BlobStore {
-  private db = new Map<string, { rev: number; blob: string }>();
+  private db = new Map<string, { rev: number; blob: string; cas: string }>();
   async get(key: string) {
     const rec = this.db.get(key);
     if (!rec) return null;
-    return { rev: rec.rev, state: JSON.parse(rec.blob) as WFState };
+    return {
+      rev: rec.rev,
+      state: JSON.parse(rec.blob) as WFState,
+      cas: rec.cas,
+    };
   }
-  async put(key: string, state: WFState, expectedRev: number | null = null) {
+  async put(key: string, state: WFState, cas: string | null = null) {
     const rec = this.db.get(key);
     if (!rec) {
-      if (expectedRev && expectedRev !== 0)
-        throw new ConflictError("No record, unexpected expectedRev");
+      if (cas !== null) throw new ConflictError("No record");
       const rev = 1;
-      this.db.set(key, { rev, blob: JSON.stringify(state) });
+      const newRec = { rev, blob: JSON.stringify(state), cas: `r${rev}` };
+      this.db.set(key, newRec);
       return rev;
     }
-    if (expectedRev !== null && expectedRev !== rec.rev)
-      throw new ConflictError();
+    if (cas === null || cas !== rec.cas) throw new ConflictError();
     const rev = rec.rev + 1;
     rec.rev = rev;
+    rec.cas = `r${rev}`;
     rec.blob = JSON.stringify(state);
     return rev;
   }
@@ -191,18 +193,18 @@ export class WorkflowEngine {
     for (;;) {
       const got = await this.store.get(wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s } = got;
+      const { rev, state: s, cas } = got as any;
 
       // 1) Fire due timers
-      for (const t of Object.values(s.tasks)) {
-        if (t.type === "sleep" && t.status === "pending") {
-          if (parseISO(t.run_after) <= tNow) {
-            t.status = "completed";
+      for (const task of Object.values(s.tasks as Record<string, Task>)) {
+        if (task.type === "sleep" && task.status === "pending") {
+          if (parseISO(task.run_after) <= tNow) {
+            task.status = "completed";
             s.history.push({
               ts: iso(tNow),
               type: "TIMER_FIRED",
-              task_id: t.id,
-              label: (t as SleepTask).label,
+              task_id: task.id,
+              label: (task as SleepTask).label,
             });
             s.need_decide = true;
           }
@@ -221,7 +223,7 @@ export class WorkflowEngine {
       s.updated_at = iso(tNow);
 
       try {
-        const newRev = await this.store.put(wfId, s, rev);
+        const newRev = await this.store.put(wfId, s, cas ?? null);
         return {
           rev: newRev,
           next_wake: s.next_wake,
@@ -244,32 +246,36 @@ export class WorkflowEngine {
     for (;;) {
       const got = await this.store.get(wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s } = got;
+      const { rev, state: s, cas } = got as any;
 
       const leased: ExecTask[] = [];
-      const tasks = Object.values(s.tasks).sort((a, b) =>
-        a.id.localeCompare(b.id)
+      const tasks = Object.values(s.tasks as Record<string, Task>).sort(
+        (a, b) => a.id.localeCompare(b.id)
       );
-      for (const t of tasks) {
-        if (t.type !== "exec") continue;
-        if (t.status === "completed" || t.status === "failed") continue;
+      for (const tsk of tasks) {
+        if (tsk.type !== "exec") continue;
+        if (tsk.status === "completed" || tsk.status === "failed") continue;
 
         // if leased, check expiry
-        if (t.status === "leased") {
-          if (t.lease && parseISO(t.lease.expires_at) > tNow) continue; // still leased
+        if (tsk.status === "leased") {
+          if (
+            (tsk as ExecTask).lease &&
+            parseISO((tsk as ExecTask).lease!.expires_at) > tNow
+          )
+            continue; // still leased
         }
 
         // pending and due?
-        if (parseISO(t.run_after) <= tNow) {
-          t.status = "leased";
-          const nextToken = (t.fence ?? 0) + 1;
-          t.fence = nextToken;
-          (t as ExecTask).lease = {
+        if (parseISO(tsk.run_after) <= tNow) {
+          tsk.status = "leased";
+          const nextToken = ((tsk as ExecTask).fence ?? 0) + 1;
+          (tsk as ExecTask).fence = nextToken;
+          (tsk as ExecTask).lease = {
             owner: workerId,
             token: nextToken,
             expires_at: iso(addSeconds(tNow, leaseSecs)),
           };
-          leased.push(t as ExecTask);
+          leased.push(tsk as ExecTask);
           if (leased.length >= maxN) break;
         }
       }
@@ -277,7 +283,7 @@ export class WorkflowEngine {
       if (!leased.length) return [];
 
       try {
-        await this.store.put(wfId, s, rev);
+        await this.store.put(wfId, s, cas ?? null);
         return JSON.parse(JSON.stringify(leased)) as ExecTask[]; // deep copy
       } catch (e) {
         if (e instanceof ConflictError) continue;
@@ -301,7 +307,7 @@ export class WorkflowEngine {
     for (;;) {
       const got = await this.store.get(wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s } = got;
+      const { rev, state: s, cas } = got as any;
 
       const t = s.tasks[taskId] as ExecTask | undefined;
       if (!t) return { rev, status: s.status as WFStatus, already: true };
@@ -359,7 +365,7 @@ export class WorkflowEngine {
       s.updated_at = iso(tNow);
 
       try {
-        const newRev = await this.store.put(wfId, s, rev);
+        const newRev = await this.store.put(wfId, s, cas ?? null);
         return { rev: newRev, status: s.status as WFStatus };
       } catch (e) {
         if (e instanceof ConflictError) continue;
@@ -380,7 +386,7 @@ export class WorkflowEngine {
     for (;;) {
       const got = await this.store.get(wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s } = got;
+      const { rev, state: s, cas } = got as any;
       const t = s.tasks[taskId] as ExecTask | undefined;
       if (!t || t.type !== "exec" || t.status !== "leased" || !t.lease)
         throw new Error("not leased");
@@ -390,7 +396,7 @@ export class WorkflowEngine {
       if (currentExp < tNow) throw new Error("lease expired");
       t.lease.expires_at = iso(addSeconds(currentExp, extraSeconds));
       try {
-        await this.store.put(wfId, s, rev);
+        await this.store.put(wfId, s, cas ?? null);
         return;
       } catch (e) {
         if (e instanceof ConflictError) continue;
@@ -403,14 +409,14 @@ export class WorkflowEngine {
     for (;;) {
       const got = await this.store.get(wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
-      const { rev, state: s } = got;
+      const { rev, state: s, cas } = got as any;
       s.signals ??= [];
       s.signals.push({ ts: iso(tNow), name, payload });
       s.history.push({ ts: iso(tNow), type: "SIGNAL", name, payload });
       s.need_decide = true;
       s.updated_at = iso(tNow);
       try {
-        const newRev = await this.store.put(wfId, s, rev);
+        const newRev = await this.store.put(wfId, s, cas ?? null);
         return { rev: newRev };
       } catch (e) {
         if (e instanceof ConflictError) continue;

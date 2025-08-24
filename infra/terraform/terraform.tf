@@ -8,3 +8,13 @@ terraform {
 
   required_version = ">= 1.2"
 }
+
+variable "hobo_bucket_name" {
+  type        = string
+  description = "S3 bucket name to store workflow state"
+}
+
+variable "hobo_queue_name" {
+  type        = string
+  description = "SQS queue name for workflow work items"
+}

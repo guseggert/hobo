@@ -72,6 +72,22 @@ async function main() {
 main();
 ```
 
+### AWS backends
+
+Environment variables:
+
+- `HOBO_S3_BUCKET`: S3 bucket for workflow state
+- `HOBO_S3_PREFIX`: optional, defaults to `wf/`
+- `HOBO_SQS_URL`: SQS queue URL for the work queue
+
+Terraform under `infra/terraform` provisions an S3 bucket and SQS queue:
+
+```
+cd infra/terraform
+terraform init
+terraform apply -var "hobo_bucket_name=..." -var "hobo_queue_name=..."
+```
+
 ### Tradeoffs
 
 - Like other history-driven dynamic workflow engines, history accumulates and is replayed on every tick, so decide time scales with history length.
