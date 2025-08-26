@@ -218,8 +218,6 @@ export class S3EventStore<T = unknown> implements EventStore<T> {
     }
   }
   async list(signal: AbortSignal, wfId: string, fromSeq: number, limit = 100) {
-    // For cognitive simplicity, rely on sequential reads; listing via prefix requires pagination.
-    // In minimal implementation, assume continuous seq and attempt to GET in order until miss.
     const out: EventEnvelope<T>[] = [];
     for (let i = fromSeq; out.length < limit; i++) {
       const Key = this.keyOf(wfId, i);

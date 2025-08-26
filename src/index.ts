@@ -18,6 +18,8 @@ export {
 export * from "./errors";
 export * from "./model";
 export * from "./runner";
+export * from "./stores/buffered";
+export * from "./stores/events";
 export * from "./stores/memory";
 export * from "./wfkit";
 
@@ -25,3 +27,5 @@ export * from "./backends/s3";
 export { S3ActivityTaskStore, S3EventStore } from "./backends/s3";
 export * from "./backends/sqs";
 export * from "./queue";
+export { DurableWorkQueue } from "./queues/durable";
+export { ValidatingWorkQueue } from "./queues/validating";

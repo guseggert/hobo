@@ -187,7 +187,11 @@ export class WorkflowEngine {
     private store: BlobStore,
     private deciders: DeciderRegistry,
     private taskStore?: TaskStore<any>,
-    private eventStore?: EventStore<WFEvent>
+    private eventStore?: EventStore<WFEvent>,
+    private opts?: {
+      ephemeralLeases?: boolean;
+      eventFilter?: (e: WFEvent) => boolean;
+    }
   ) {}
 
   async create(
@@ -212,10 +216,8 @@ export class WorkflowEngine {
       decider: deciderName,
       last_seq: 0,
     };
-    await this.store.put(signal, wfId, s, null);
     await this.logEvent(signal, s, { ts: iso(t), type: "WF_CREATED" });
-    const got = await this.store.get(signal, wfId);
-    await this.store.put(signal, wfId, s, got?.cas ?? null);
+    await this.store.put(signal, wfId, s, null);
     return s;
   }
 
@@ -225,33 +227,7 @@ export class WorkflowEngine {
       const got = await this.store.get(signal, wfId);
       if (!got) throw new Error(`workflow not found: ${wfId}`);
       const { state: s, cas } = got;
-
-      // 1) Fire due timers
-      for (const task of Object.values(s.tasks)) {
-        if (task.type === "sleep" && task.status === "pending") {
-          if (parseISO(task.run_after) <= tNow) {
-            task.status = "completed";
-            await this.logEvent(signal, s, {
-              ts: iso(tNow),
-              type: "TIMER_FIRED",
-              task_id: task.id,
-              label: task.label,
-            });
-            s.need_decide = true;
-          }
-        }
-      }
-
-      // 2) Decider
-      if (s.status === "running" && s.need_decide) {
-        const cmds = this.deciders.get(s.decider)(s.ctx, s.history);
-        await this.applyCommands(signal, s, cmds, tNow);
-        s.need_decide = false;
-      }
-
-      // 3) next_wake
-      s.next_wake = this.computeNextWake(s);
-      s.updated_at = iso(tNow);
+      await this.advance(signal, s, tNow);
 
       try {
         const newRev = await this.store.put(signal, wfId, s, cas ?? null);
@@ -311,6 +287,10 @@ export class WorkflowEngine {
 
       if (!leased.length) return [];
 
+      if (this.opts?.ephemeralLeases) {
+        return JSON.parse(JSON.stringify(leased)) as ExecTask[];
+      }
+
       try {
         await this.store.put(signal, wfId, s, cas ?? null);
         return JSON.parse(JSON.stringify(leased)) as ExecTask[]; // deep copy
@@ -345,13 +325,14 @@ export class WorkflowEngine {
         return { rev: got.rev, status: s.status, already: true };
 
       // Fencing guard
-      if (
-        t.status !== "leased" ||
-        !t.lease ||
-        (leaseToken !== undefined && t.lease.token !== leaseToken)
-      ) {
-        // Stale or not yours; ignore safely
-        return { rev: got.rev, status: s.status, already: true };
+      if (!this.opts?.ephemeralLeases) {
+        if (
+          t.status !== "leased" ||
+          !t.lease ||
+          (leaseToken !== undefined && t.lease.token !== leaseToken)
+        ) {
+          return { rev: got.rev, status: s.status, already: true };
+        }
       }
 
       if (success) {
@@ -416,6 +397,131 @@ export class WorkflowEngine {
         throw e;
       }
     }
+  }
+
+  /** Batch variant to reduce round-trips: apply many completions in one CAS cycle. */
+  async completeActivities(
+    signal: AbortSignal,
+    wfId: string,
+    items: Array<{
+      taskId: string;
+      success: boolean;
+      resultOrError: any;
+      leaseToken?: number;
+    }>,
+    opts?: { decideNow?: boolean },
+    tNow: Date = now()
+  ): Promise<{ rev: number; status: WFStatus; next_wake?: string | null }> {
+    for (;;) {
+      const got = await this.store.get(signal, wfId);
+      if (!got) throw new Error(`workflow not found: ${wfId}`);
+      const { state: s, cas } = got;
+
+      let anyMutation = false;
+      for (const { taskId, success, resultOrError, leaseToken } of items) {
+        const t = s.tasks[taskId] as ExecTask | undefined;
+        if (!t) continue;
+        if (t.status === "completed" || t.status === "failed") continue;
+        if (!this.opts?.ephemeralLeases) {
+          if (
+            t.status !== "leased" ||
+            !t.lease ||
+            (leaseToken !== undefined && t.lease.token !== leaseToken)
+          )
+            continue;
+        }
+
+        if (success) {
+          t.status = "completed";
+          t.result = resultOrError;
+          await this.logEvent(signal, s, {
+            ts: iso(tNow),
+            type: "ACTIVITY_COMPLETED",
+            task_id: t.id,
+            result: t.result,
+          });
+        } else {
+          t.tries = (t.tries ?? 0) + 1;
+          let err: HoboErrorObjectType;
+          if (resultOrError instanceof HoboError) err = resultOrError.toJSON();
+          else {
+            try {
+              err = HoboErrorObject.parse(resultOrError);
+            } catch {
+              err = {
+                type: "non_retryable",
+                message: String(
+                  (resultOrError as { message?: string })?.message ??
+                    resultOrError
+                ),
+                cause: undefined,
+              };
+            }
+          }
+          t.error = err;
+          if (t.tries >= (t.max_tries ?? 3)) {
+            t.status = "failed";
+            await this.logEvent(signal, s, {
+              ts: iso(tNow),
+              type: "ACTIVITY_FAILED",
+              task_id: t.id,
+              error: err,
+            });
+            s.status = "failed";
+          } else {
+            const del = t.retry_delays?.[t.tries - 1];
+            const backoff = del ?? Math.min(300, 2 ** t.tries);
+            t.status = "pending";
+            t.lease = null;
+            t.run_after = iso(addSeconds(tNow, backoff));
+            await this.logEvent(signal, s, {
+              ts: iso(tNow),
+              type: "ACTIVITY_RETRY",
+              task_id: t.id,
+              after_seconds: backoff,
+            });
+          }
+        }
+        anyMutation = true;
+      }
+
+      if (!anyMutation) return { rev: got.rev, status: s.status };
+      s.need_decide = true;
+      if (opts?.decideNow) await this.advance(signal, s, tNow);
+      else s.updated_at = iso(tNow);
+
+      try {
+        const newRev = await this.store.put(signal, wfId, s, cas ?? null);
+        return { rev: newRev, status: s.status, next_wake: s.next_wake };
+      } catch (e) {
+        if (e instanceof HoboError && e.obj.type === "conflict") continue;
+        throw e;
+      }
+    }
+  }
+
+  private async advance(signal: AbortSignal, s: WFState, tNow: Date) {
+    for (const task of Object.values(s.tasks)) {
+      if (task.type === "sleep" && task.status === "pending") {
+        if (parseISO(task.run_after) <= tNow) {
+          task.status = "completed";
+          await this.logEvent(signal, s, {
+            ts: iso(tNow),
+            type: "TIMER_FIRED",
+            task_id: task.id,
+            label: task.label,
+          });
+          s.need_decide = true;
+        }
+      }
+    }
+    if (s.status === "running" && s.need_decide) {
+      const cmds = this.deciders.get(s.decider)(s.ctx, s.history);
+      await this.applyCommands(signal, s, cmds, tNow);
+      s.need_decide = false;
+    }
+    s.next_wake = this.computeNextWake(s);
+    s.updated_at = iso(tNow);
   }
 
   /** Extend an active lease (heartbeat). Throws if not leased by `owner` with `token`. */
@@ -515,11 +621,13 @@ export class WorkflowEngine {
           break;
         case "set":
           this.setPath(s.ctx, c.key, c.value);
-          await this.logEvent(signal, s, {
-            ts: iso(tNow),
-            type: "CTX_SET",
-            key: c.key,
-          });
+          if (!c.key.startsWith("$wf")) {
+            await this.logEvent(signal, s, {
+              ts: iso(tNow),
+              type: "CTX_SET",
+              key: c.key,
+            });
+          }
           break;
         case "complete_workflow":
           s.status = "completed";
@@ -626,6 +734,7 @@ export class WorkflowEngine {
     task.createdAt = iso(tNow);
     task.updatedAt = iso(tNow);
     task.version = "0";
+    s.tasks[id] = task;
     if (this.taskStore) {
       await this.taskStore.put(signal, s.id, id, task, undefined);
     }
