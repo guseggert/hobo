@@ -1,106 +1,46 @@
 ## hobo
 
-Hobo is a portable serverless workflow engine. It's designed to enable long-running, resilient distributed workflows with _minimal infrastructure_.
+Hobo is a simple, minimal-infrastructure workflow engine. It's primary goal is to enable long-running, resilient distributed workflows using common infrastructure primitives you probably already have, with no new microservices.
 
-It accomplishes this by requiring only two primitives:
+It requires three primitives:
 
-- a blob store
+- a key-value store
 - a work queue
+- workers
 
-There are otherwise no servers nor infrastructure to manage, outside of your workers.
+Hobo implements a state machine on top of these. Your workers:
 
-Hobo clients in various languages can safely interact with each other, even within the same workflow.
+- Receive the current state and a context blob
+- Execute
+- Return an action + new context. Actions can be:
+  - Transition to a new state
+  - Repeat the current state after a delay
+  - Fail the execution
+  - Succeed the execution
 
-## Entities
-
-- Workflow: distributed control flow
-- Activity: a unit of potentially-side-effecting work
-- Task
-  - Decision Task: a specific execution of work for evaluating control flow
-  - Activity Task: a specific execution of an activity
-- Store: the place where workflow and activity state is tracked
-- Queue: the mechanism used for ensuring that tasks are distributed to
-- Worker: a process that receives nudges to carry out task executions from the queue, updating state and scheduling further tasks as necessary
-- State
-  - Decision state: stores control flow state, including an event log for idempotency, worker leases, workflow metadata, etc.
-  - Task state: stores task state such as input, output, scheduling information like retries, worker leases, etc.
-
-### Core
-
-### TypeScript
-
-The TypeScript implementation provides a DSL for writing workflows as generator functions that `yield` effects such as:
-
-- `exec`: run an activity (with configurable retries)
-- `sleep`/`until`: wait for some period of time
-- `signal`: wait for a specific external signal to be sent to the workflow
-- `all`: fan-out and wait for all subtasks to complete
-- `race`: fan-out and wait for the first subtask to complete
-- `set`: update the workflow state object
-- `complete`/`fail`: finish the workflow
-
-Similar to other workflow DSLs, Hobo uses _derministic replay_. Each tick replays the entire workflow from the start, feeding the history until the next wait point. This means workflow code must be idempotent!
-
-#### Example
+### Example
 
 ```ts
-import {
-  InMemoryBlobStore,
-  DeciderRegistry,
-  WorkflowEngine,
-} from "./src/engine";
-import { WorkflowRunner } from "./src/runner";
-import { defineWorkflow } from "./src/wfkit";
-import { registerActivity } from "./src/activities";
-
-// Register an activity to perform work
-registerActivity("greet", async (input: any) => ({
-  message: `hi ${input?.name ?? "hobo"}`,
-}));
-
-// Define the workflow as an async generator using effects created on `io`
-const hello = defineWorkflow("hello", function* (io, params) {
-  const r = yield io.exec("greet", { name: params?.name ?? "hobo" });
-  yield io.set("greeting", r);
-  return yield io.complete(r);
-});
-
-// Pick your blob implementation
-const store = new InMemoryBlobStore();
-
-// Register the workflow
-const reg = new DeciderRegistry();
-reg.register("demo:hello", hello);
-
-// Build the engine and runner
-const engine = new WorkflowEngine(store, reg);
-const runner = new WorkflowRunner(engine, store);
-
-async function main() {
-  await engine.create("wf_1", "demo:hello", { params: { name: "world" } });
-  const status = await runner.runToCompletion("wf_1");
-  const got = await store.get("wf_1");
-  console.log(status, got?.state.ctx.greeting);
-}
-
-main();
-```
-
-### AWS backends
-
-Environment variables:
-
-- `HOBO_S3_BUCKET`: S3 bucket for workflow state
-- `HOBO_S3_PREFIX`: optional, defaults to `wf/`
-- `HOBO_SQS_URL`: SQS queue URL for the work queue
-
-Terraform under `infra/terraform` provisions an S3 bucket and SQS queue:
 
 ```
-cd infra/terraform
-terraform init
-terraform apply -var "hobo_bucket_name=..." -var "hobo_queue_name=..."
-```
+
+### Versioning & Deployments
+
+A common challenge with workflow engines is versioning the control flow and activities. However often this complexity is unnecessary.
+
+Thus, Hobo is unopinionated. You can version your control flow by inserting a version in the context, or you can keep your control flow unversioned and backwards-compatible. It's up to you.
+
+### Idempotency
+
+As with most workflows, activities guarantee at-least-once execution, so should be idempotent. Worker code may be executed any number of times, it must be idempotent.
+
+### Fan-out
+
+Hobo is extremely horizontally scalable. Work fan-out can be accomplished by created many sub-workflow executions, and aggregating the results in a state machine loop.
+
+### Signals
+
+Signals are useful for the workflow to pause until some external event occurs and "wakes up" the workflow.
 
 ### Tradeoffs
 
